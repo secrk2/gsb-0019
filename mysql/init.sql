@@ -192,6 +192,7 @@ CREATE TABLE IF NOT EXISTS writing_versions (
   base_version_id INT NULL,
   parent_version_id INT NULL,
   branch_from_version_id INT NULL,
+  branch_from_version_no INT NULL,      -- 分支来源版本号（冗余留痕）
   content_json MEDIUMTEXT NOT NULL,
   summary VARCHAR(300) NOT NULL DEFAULT '',
   mask_snapshot_json MEDIUMTEXT NOT NULL,

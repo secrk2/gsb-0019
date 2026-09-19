@@ -30,6 +30,22 @@
       <p class="small" style="margin: 6px 0 0">双方修改都已保留、无人被覆盖，也不会锁定文档；取舍完成后生成「冲突合并」版本。</p>
     </div>
 
+    <!-- 自动合并提示：链头在自己编辑期间前进，保存时自动并入了对方改动的段落 -->
+    <div v-if="mergeNotice.length" class="conflict-banner mt16" style="border-color: var(--purple)">
+      <div class="row spread">
+        <strong>↪️ 已自动合并对方在此期间保存的 {{ mergeNotice.length }} 处改动（你的段落均未丢失）</strong>
+        <button class="btn sm" @click="mergeNotice = []">知道了</button>
+      </div>
+      <ul class="small" style="margin: 6px 0 0; padding-left: 18px">
+        <li v-for="(m, i) in mergeNotice" :key="i">
+          【{{ sectionTitle(m.section_key) }}】{{ mergeKindText(m.kind) }}：
+          <span v-if="m.kind === 'removed'">该段已被对方删除</span>
+          <span v-else>{{ snippet(m.text) }}</span>
+        </li>
+      </ul>
+      <p class="small muted" style="margin: 6px 0 0">双方改了同一段且内容不一致时不会自动取舍，会弹出逐段取舍窗口。</p>
+    </div>
+
     <div v-if="isFirm && maskPreview" class="mask-note mt8">
       正在以客户视角预览（按各版本保存时的脱敏规则快照渲染，规则更新不影响历史版本）；此视图只读，切回原文后可编辑。
     </div>
@@ -330,6 +346,16 @@ const choices = ref([])
 const solving = ref(false)
 const resolveError = ref('')
 
+const mergeNotice = ref([])
+const mergeNoticeVer = ref(null)
+function mergeKindText(k) {
+  return ({ added: '并入对方新增段', modified: '并入对方修改', removed: '对方删除' })[k] || '自动合并'
+}
+function snippet(t) {
+  const s = String(t || '')
+  return s.length > 60 ? `${s.slice(0, 60)}…` : s
+}
+
 const voidOpen = ref(false)
 const voidReason = ref('')
 const voidError = ref('')
@@ -376,6 +402,8 @@ watch(
   () => [props.doc.id, props.doc.current_version, props.doc.conflicts.length],
   () => {
     conflict.value = null
+    // 刚保存完的 reload 会把 current_version 推到新版本号，此时保留该次保存的自动合并提示
+    if (mergeNoticeVer.value !== props.doc.current_version) mergeNotice.value = []
     maskPreview.value = false
     maskedDoc.value = null
     baseVersionId.value = props.doc.head_version_id
@@ -419,6 +447,8 @@ async function doSave(finalize) {
       summary: saveSummary.value,
     })
     store.showToast(`已保存第 ${r.data.version_no} 版`, 'success')
+    mergeNotice.value = r.data.branched ? (r.data.auto_merged_paragraphs || []) : []
+    mergeNoticeVer.value = r.data.branched ? r.data.version_no : null
     draft.value = null
     saveSummary.value = ''
     branchedHint.value = r.data.branched ? docVersionNo(baseVersionId.value) : null
@@ -484,6 +514,8 @@ async function submitFinal() {
     })
     store.showToast(`已定稿（v${r.data.version_no}），定稿提交期限已生成`, 'success')
     finalizeOpen.value = false
+    mergeNotice.value = r.data.branched ? (r.data.auto_merged_paragraphs || []) : []
+    mergeNoticeVer.value = r.data.branched ? r.data.version_no : null
     draft.value = null
     emit('reload')
     emit('changed')

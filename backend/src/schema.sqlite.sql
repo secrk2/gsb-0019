@@ -196,6 +196,7 @@ CREATE TABLE IF NOT EXISTS writing_versions (
   base_version_id INTEGER NULL,
   parent_version_id INTEGER NULL,
   branch_from_version_id INTEGER NULL,  -- 非空表示该版本从历史版本重开（分支）
+  branch_from_version_no INTEGER NULL,  -- 分支来源版本号（冗余留痕，便于直接展示）
   content_json TEXT NOT NULL,           -- {sections:[{key,title,paragraphs:[{id,text,sensitive}]}]}
   summary TEXT NOT NULL DEFAULT '',     -- 保存说明（留痕，必填或默认生成）
   mask_snapshot_json TEXT NOT NULL,     -- 保存时生效的脱敏规则快照

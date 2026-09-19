@@ -166,3 +166,33 @@ export function threeWayMerge(base, incoming, pending, meta = {}) {
 
   return { merged: { sections: mergedSections }, conflicts, autoMerged }
 }
+
+// 列出自动合并结果中「后来者本人提交里没有、由链头一方改动自动并入」的段落，
+// 供保存成功后明确告知：哪些段落采用了对方的修改（对方删除的段以 kind:'removed' 标注）。
+export function mergedFromIncoming(base, pending, merged) {
+  const bi = indexSections(base)
+  const pi = indexSections(pending)
+  const out = []
+  for (const sec of merged.sections || []) {
+    const bSec = bi.get(sec.key)
+    const pSec = pi.get(sec.key)
+    for (const p of sec.paragraphs || []) {
+      const pp = pSec?.map.get(p.id)
+      const bp = bSec?.map.get(p.id)
+      if (pp && pp.text === p.text) continue
+      if (!pp) {
+        // 后来者提交里没有该段：对方新增（基线也没有）或后来者视图缺失而链头有
+        out.push({ section_key: sec.key, paragraph_id: p.id, text: p.text, kind: 'added' })
+      } else if (!bp || bp.text !== p.text) {
+        // 后来者有同段但文字与并入结果不同，且并入结果不是基线原文 → 采用了对方文本
+        out.push({ section_key: sec.key, paragraph_id: p.id, text: p.text, kind: 'modified' })
+      }
+    }
+    // 后来者仍保留、基线也存在，但合并结果里没有 → 对方删除了该段，自动生效
+    for (const id of pSec?.order || []) {
+      if ((sec.paragraphs || []).some((p) => p.id === id)) continue
+      if (bSec?.map.has(id)) out.push({ section_key: sec.key, paragraph_id: id, text: '', kind: 'removed' })
+    }
+  }
+  return out
+}

@@ -4,7 +4,7 @@ import { assertClientAccess } from '../middleware/auth.js'
 import { isFirmRole } from '../lib/mask.js'
 import { docKindDef, normalizeContent, contentEqual, contentParagraphCount, DOC_STATUS } from '../lib/writing.js'
 import { DEFAULT_RULES, maskContent, maskParagraphText, compilePatterns, reconcileClientContent, restorePlaceholders } from '../lib/docMask.js'
-import { diffContent, threeWayMerge } from '../lib/paragraphs.js'
+import { diffContent, threeWayMerge, mergedFromIncoming } from '../lib/paragraphs.js'
 import { computeDueDate, daysLeft, ANCHORS, DAY_BASES } from '../lib/deadlineCalc.js'
 import { getCalendar } from './holidayService.js'
 import { nowIso, tzToday, addDays } from '../lib/dates.js'
@@ -35,16 +35,12 @@ function assertCanRead(user, _kind) {
   if (!firm(user) && user.role !== 'client_admin') throw new ApiError(403, 'ROLE_DENIED', '无权查看撰稿文档')
 }
 
-// 当前生效的脱敏规则（由 activeRules 刷新），用于客户侧视图的展示脱敏
-let liveRules = { version: 0, ...DEFAULT_RULES }
-
+// 当前生效的脱敏规则（由 activeRules 读取 DB 刷新），仅用于新保存版本的快照与总览版本号展示；
+// 历史版本一律用各自 writing_versions.mask_snapshot_json 渲染，不读本变量。
 async function activeRules() {
   const rows = await query('SELECT * FROM mask_rules WHERE is_active = 1 ORDER BY version DESC LIMIT 1')
-  let cur
-  if (!rows.length) cur = { version: 0, rules: { version: 0, ...DEFAULT_RULES } }
-  else cur = { id: rows[0].id, version: rows[0].version, rules: { version: rows[0].version, ...JSON.parse(rows[0].rules_json) } }
-  liveRules = cur.rules
-  return cur
+  if (!rows.length) return { version: 0, rules: { version: 0, ...DEFAULT_RULES } }
+  return { id: rows[0].id, version: rows[0].version, rules: { version: rows[0].version, ...JSON.parse(rows[0].rules_json) } }
 }
 
 async function getDocById(docId) {
@@ -65,6 +61,20 @@ function parseVersion(v) {
     content: JSON.parse(v.content_json),
     mask_snapshot: JSON.parse(v.mask_snapshot_json),
   }
+}
+
+// 自动并入段落明细对客户侧的过滤：整章隐藏/敏感段不下发，其余按版本快照脱敏
+function presentMergedDetails(details, viewer, headVersion, baseVersion) {
+  if (firm(viewer) || !details.length) return details
+  const rules = parseVersion(baseVersion).mask_snapshot
+  const hideSections = new Set(rules.hideSections || [])
+  const sensitiveIds = new Set()
+  for (const s of parseVersion(headVersion).content.sections || []) {
+    for (const p of s.paragraphs || []) if (p.sensitive) sensitiveIds.add(`${s.key}|${p.id}`)
+  }
+  return details
+    .filter((d) => !hideSections.has(d.section_key) && !sensitiveIds.has(`${d.section_key}|${d.paragraph_id}`))
+    .map((d) => ({ ...d, text: maskTextSafeWith(d.text, rules) }))
 }
 
 // ============ 版本展示（客户脱敏 / 代理原文，同一版本行）============
@@ -89,7 +99,9 @@ function presentVersion(v, viewer, { branchVersionNo = null } = {}) {
   if (firm(viewer)) {
     return { ...base, content: pv.content, masked: false, masked_paragraphs: 0 }
   }
-  const masked = maskContent(pv.content, liveRules)
+  // 历史版本永远按该版本保存时的规则快照脱敏（mask_snapshot），
+  // 所里后续发布新规则不回改任何已发出的版本内容。
+  const masked = maskContent(pv.content, pv.mask_snapshot)
   return { ...base, content: masked, masked: true, masked_paragraphs: masked.masked_paragraphs }
 }
 
@@ -248,9 +260,9 @@ export async function restartFrom(user, caseId, kind, body = {}) {
       [caseId, kind, sourceDoc.title, DOC_STATUS.DRAFT, 0, user.id, now, now]
     )
     const vid = await dh.insert(
-      `INSERT INTO writing_versions (doc_id, version_no, save_type, base_version_id, parent_version_id, branch_from_version_id, content_json, summary, mask_snapshot_json, actor_id, actor_name, actor_role, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [docId, 1, '草稿', null, null, source.id, source.content_json,
+      `INSERT INTO writing_versions (doc_id, version_no, save_type, base_version_id, parent_version_id, branch_from_version_id, branch_from_version_no, content_json, summary, mask_snapshot_json, actor_id, actor_name, actor_role, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [docId, 1, '草稿', null, null, source.id, source.version_no, source.content_json,
        `自${sourceDoc.status === DOC_STATUS.VOID ? '作废' : '历史'}稿第 ${source.version_no} 版重开`, snapshot, user.id, user.name, user.role, now]
     )
     await dh.query('UPDATE writing_docs SET current_version = 1, head_version_id = ?, updated_at = ? WHERE id = ?', [vid, now, docId])
@@ -412,16 +424,20 @@ export async function saveVersion(user, caseId, kind, body = {}) {
   let toSave = pendingRaw
   let branchFrom = null
   let autoMerged = 0
+  let autoMergedDetails = []
 
   if (head && base && head.id !== base.id) {
     // 双方基于同一版本各自改过：三路合并用各方真实原文（客户提交未经脱敏对账的形态由
-    // reconcile 已还原不可见段），逐段判定
+    // reconcile 已还原不可见段），逐段判定。无论先来者是谁都一视同仁：
+    //   - 只一方改的段落自动合入 merged（绝不拿后来者全文覆盖链头、也不丢对方段落）；
+    //   - 双方改同一段且不一致 → 登记待取舍冲突，弹逐段取舍界面。
     const merged = threeWayMerge(parseVersion(base).content, parseVersion(head).content, pendingRaw, {
       incomingActorName: head.actor_name,
       pendingActorName: user.name,
     })
     autoMerged = merged.autoMerged
-    if (merged.conflicts.length && head.actor_id === user.id) {
+    autoMergedDetails = mergedFromIncoming(parseVersion(base).content, pendingRaw, merged.merged)
+    if (merged.conflicts.length) {
       // 不覆盖、不拒绝：登记待取舍冲突（后来者本次尝试全文留痕），返回取舍界面所需全部数据。
       // 待取舍行幂等：同一 doc+paragraph 已有待取舍记录时复用，避免后来者反复撞出重复行。
       const now = nowIso()
@@ -479,11 +495,13 @@ export async function saveVersion(user, caseId, kind, body = {}) {
         conflicts: clientConflicts,
         merged_preview: firm(user) ? merged.merged : maskContent(merged.merged, baseRules),
         auto_merged: autoMerged,
+        auto_merged_paragraphs: presentMergedDetails(autoMergedDetails, user, head, base),
         pending_content: firm(user) ? toSave : maskContent(toSave, baseRules),
         masked: !firm(user),
       })
     }
-    toSave = pendingRaw
+    // 无冲突：落自动合并后的全文（对方改动的段落已并入，后来者没动过的段落不会被其旧副本覆盖）
+    toSave = merged.merged
     branchFrom = base.id
   }
 
@@ -498,9 +516,9 @@ export async function saveVersion(user, caseId, kind, body = {}) {
   const result = await tx(async (dh) => {
     const no = doc.current_version + 1
     const vid = await dh.insert(
-      `INSERT INTO writing_versions (doc_id, version_no, save_type, base_version_id, parent_version_id, branch_from_version_id, content_json, summary, mask_snapshot_json, actor_id, actor_name, actor_role, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [doc.id, no, saveType, base?.id ?? null, head?.id ?? null, branchFrom, JSON.stringify(toSave), summary.slice(0, 300), snapshotJson,
+      `INSERT INTO writing_versions (doc_id, version_no, save_type, base_version_id, parent_version_id, branch_from_version_id, branch_from_version_no, content_json, summary, mask_snapshot_json, actor_id, actor_name, actor_role, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [doc.id, no, saveType, base?.id ?? null, head?.id ?? null, branchFrom, branchFrom ? base.version_no : null, JSON.stringify(toSave), summary.slice(0, 300), snapshotJson,
        user.id, user.name, user.role, now]
     )
     await dh.query(
@@ -520,6 +538,7 @@ export async function saveVersion(user, caseId, kind, body = {}) {
     return { vid, no, deadlineId }
   })
   if (deadlineSpec) await bumpDash()
+  const mergedDetails = branchFrom ? presentMergedDetails(autoMergedDetails, user, head, base) : autoMergedDetails
   return {
     doc_id: doc.id,
     version_id: result.vid,
@@ -527,6 +546,7 @@ export async function saveVersion(user, caseId, kind, body = {}) {
     save_type: saveType,
     branched: Boolean(branchFrom),
     auto_merged: autoMerged,
+    auto_merged_paragraphs: mergedDetails,
     deadline: deadlineSpec ? { id: result.deadlineId, dtype: deadlineSpec.dtype, due_date: deadlineSpec.due_date, anchor: deadlineSpec.anchor, day_basis: deadlineSpec.day_basis } : null,
     status: finalize ? DOC_STATUS.FINAL : DOC_STATUS.DRAFT,
   }
@@ -785,11 +805,11 @@ export async function downloadAttachmentVersion(user, attachmentId, versionNo) {
   if (!att) throw new ApiError(404, 'NOT_FOUND', '附件不存在')
   const doc = await getDocById(att.doc_id)
   await assertAttachmentAccess(user, doc, false)
-  // 附件原件一律取当前版本（历史版本行仅供留痕追溯）
-  const no = att.current_version
-  void versionNo
-  const vrows = await query('SELECT * FROM writing_attachment_versions WHERE attachment_id = ? AND version_no = ?', [attachmentId, no])
-  if (!vrows.length) throw new ApiError(404, 'NOT_FOUND', '该附件版本不存在')
+  // 按请求的版本号取该版本自己的不可变 object_key；未指定版本号才取当前版。
+  // 换版只追加新行、新 key，旧版本原件永远打得开，不会被新版顶替。
+  const wantNo = versionNo != null && Number(versionNo) > 0 ? Number(versionNo) : att.current_version
+  const vrows = await query('SELECT * FROM writing_attachment_versions WHERE attachment_id = ? AND version_no = ? ORDER BY version_no', [attachmentId, wantNo])
+  if (!vrows.length) throw new ApiError(404, 'NOT_FOUND', `该附件第 ${wantNo} 版不存在（可用版本：1~${att.current_version}）。`)
   const v = vrows[0]
   if (!v.size_bytes) throw new ApiError(409, 'NOT_UPLOADED', '该版本尚未上传完成（对象存储中无原件）。')
   let buf
