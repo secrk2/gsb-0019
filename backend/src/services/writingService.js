@@ -35,16 +35,10 @@ function assertCanRead(user, _kind) {
   if (!firm(user) && user.role !== 'client_admin') throw new ApiError(403, 'ROLE_DENIED', '无权查看撰稿文档')
 }
 
-// 当前生效的脱敏规则（由 activeRules 刷新），用于客户侧视图的展示脱敏
-let liveRules = { version: 0, ...DEFAULT_RULES }
-
 async function activeRules() {
   const rows = await query('SELECT * FROM mask_rules WHERE is_active = 1 ORDER BY version DESC LIMIT 1')
-  let cur
-  if (!rows.length) cur = { version: 0, rules: { version: 0, ...DEFAULT_RULES } }
-  else cur = { id: rows[0].id, version: rows[0].version, rules: { version: rows[0].version, ...JSON.parse(rows[0].rules_json) } }
-  liveRules = cur.rules
-  return cur
+  if (!rows.length) return { version: 0, rules: { version: 0, ...DEFAULT_RULES } }
+  return { id: rows[0].id, version: rows[0].version, rules: { version: rows[0].version, ...JSON.parse(rows[0].rules_json) } }
 }
 
 async function getDocById(docId) {
@@ -69,7 +63,7 @@ function parseVersion(v) {
 
 // ============ 版本展示（客户脱敏 / 代理原文，同一版本行）============
 
-function presentVersion(v, viewer, { branchVersionNo = null } = {}) {
+function presentVersion(v, viewer) {
   const pv = parseVersion(v)
   const base = {
     id: pv.id,
@@ -79,7 +73,6 @@ function presentVersion(v, viewer, { branchVersionNo = null } = {}) {
     base_version_id: pv.base_version_id,
     parent_version_id: pv.parent_version_id,
     branch_from_version_id: pv.branch_from_version_id,
-    branch_from_version_no: branchVersionNo,
     actor_id: pv.actor_id,
     actor_name: pv.actor_name,
     actor_role: pv.actor_role,
@@ -89,7 +82,8 @@ function presentVersion(v, viewer, { branchVersionNo = null } = {}) {
   if (firm(viewer)) {
     return { ...base, content: pv.content, masked: false, masked_paragraphs: 0 }
   }
-  const masked = maskContent(pv.content, liveRules)
+  // 客户视图永远按该版本保存当时的规则快照脱敏：规则后来调整不回改已发出的历史版本
+  const masked = maskContent(pv.content, pv.mask_snapshot)
   return { ...base, content: masked, masked: true, masked_paragraphs: masked.masked_paragraphs }
 }
 
@@ -301,7 +295,7 @@ export async function getDocDetail(user, docId, { maskPreview = false } = {}) {
     mask_preview: maskPreview && firm(user),
     versions,
     head: d.head_version_id ? presentVersion(vrows.find((v) => v.id === d.head_version_id), viewer) : null,
-    final: d.final_version_id ? presentVersion(vrows.find((v) => v.id === d.final_version_id), viewer, {}) : null,
+    final: d.final_version_id ? presentVersion(vrows.find((v) => v.id === d.final_version_id), viewer) : null,
     conflicts: conflicts.map((c) => {
       const baseVer = vById.get(c.base_version_id)
       const snap = baseVer ? parseVersion(baseVer).mask_snapshot : DEFAULT_RULES
@@ -412,18 +406,23 @@ export async function saveVersion(user, caseId, kind, body = {}) {
   let toSave = pendingRaw
   let branchFrom = null
   let autoMerged = 0
+  let incorporated = []
 
   if (head && base && head.id !== base.id) {
     // 双方基于同一版本各自改过：三路合并用各方真实原文（客户提交未经脱敏对账的形态由
-    // reconcile 已还原不可见段），逐段判定
+    // reconcile 已还原不可见段），逐段判定。
+    // 注意：合并稿必须同时包含双方改动——只一方动过的段落自动并入对方版本，
+    // 绝不能拿后来者的整份提交当结果（否则先来者改过、后来者没碰的段落会被整段丢掉）。
     const merged = threeWayMerge(parseVersion(base).content, parseVersion(head).content, pendingRaw, {
       incomingActorName: head.actor_name,
       pendingActorName: user.name,
     })
     autoMerged = merged.autoMerged
-    if (merged.conflicts.length && head.actor_id === user.id) {
+    incorporated = merged.incorporated
+    if (merged.conflicts.length) {
       // 不覆盖、不拒绝：登记待取舍冲突（后来者本次尝试全文留痕），返回取舍界面所需全部数据。
       // 待取舍行幂等：同一 doc+paragraph 已有待取舍记录时复用，避免后来者反复撞出重复行。
+      // 同一人多端先后保存同样适用（head.actor_id === user.id 也不能静默覆盖自己另一端的改动）。
       const now = nowIso()
       const registered = await tx(async (dh) => {
         const out = []
@@ -483,7 +482,9 @@ export async function saveVersion(user, caseId, kind, body = {}) {
         masked: !firm(user),
       })
     }
-    toSave = pendingRaw
+    // 无逐段冲突：落链的是三路合并稿（含先来者已保存、后来者没碰的段落），
+    // 而不是后来者本次提交原文。
+    toSave = merged.merged
     branchFrom = base.id
   }
 
@@ -520,6 +521,16 @@ export async function saveVersion(user, caseId, kind, body = {}) {
     return { vid, no, deadlineId }
   })
   if (deadlineSpec) await bumpDash()
+  // 自动并入明细回传：明示「先来者已保存的哪些段落改动随本次保存一并并入」，
+  // 客户侧文本按基线版本快照脱敏（与其所见一致）。
+  const incRules = base ? parseVersion(base).mask_snapshot : rules.rules
+  const maskIncorporated = (items) => firm(user)
+    ? items
+    : items.map((it) => ({
+      ...it,
+      base_text: it.base_text ? maskTextSafeWith(it.base_text, incRules) : '',
+      incoming_text: it.incoming_text ? maskTextSafeWith(it.incoming_text, incRules) : '',
+    }))
   return {
     doc_id: doc.id,
     version_id: result.vid,
@@ -527,6 +538,11 @@ export async function saveVersion(user, caseId, kind, body = {}) {
     save_type: saveType,
     branched: Boolean(branchFrom),
     auto_merged: autoMerged,
+    merged_incoming: incorporated.length ? {
+      head_version_no: branchFrom ? head.version_no : null,
+      head_actor_name: branchFrom ? head.actor_name : '',
+      items: maskIncorporated(incorporated),
+    } : null,
     deadline: deadlineSpec ? { id: result.deadlineId, dtype: deadlineSpec.dtype, due_date: deadlineSpec.due_date, anchor: deadlineSpec.anchor, day_basis: deadlineSpec.day_basis } : null,
     status: finalize ? DOC_STATUS.FINAL : DOC_STATUS.DRAFT,
   }
@@ -616,12 +632,21 @@ export async function resolveConflicts(user, docId, body = {}) {
     pendingActorName: user.name,
   })
   if (headNow.id !== incomingVer.id) {
-    // 取舍期间链头又前进（对方又保存了新版本）：拒绝静默合并，让前端拉最新重新取舍
+    // 取舍期间链头又前进（对方又保存了新版本）：拒绝静默合并，让前端拉最新重新取舍。
+    // 客户侧回传一律按基线快照脱敏，不泄露原文。
+    const baseRules = parseVersion(base).mask_snapshot
+    const maskConflictTexts = (cfs) => cfs.map((cf) => ({
+      ...cf,
+      base_text: cf.base_text ? maskTextSafeWith(cf.base_text, baseRules) : '',
+      incoming_text: cf.incoming_text ? maskTextSafeWith(cf.incoming_text, baseRules) : null,
+      pending_text: cf.pending_text ? maskTextSafeWith(cf.pending_text, baseRules) : null,
+    }))
     throw new ApiError(409, 'PARAGRAPH_CONFLICT', '你取舍期间对方又保存了新版本并产生新的冲突，请基于最新版本重新取舍。', {
       head_version: { id: headNow.id, version_no: headNow.version_no, actor_name: headNow.actor_name },
-      conflicts: replay.conflicts,
-      merged_preview: replay.merged,
-      pending_content: pendingContent,
+      conflicts: firm(user) ? replay.conflicts : maskConflictTexts(replay.conflicts),
+      merged_preview: firm(user) ? replay.merged : maskContent(replay.merged, baseRules),
+      pending_content: firm(user) ? pendingContent : maskContent(pendingContent, baseRules),
+      masked: !firm(user),
     })
   }
 
@@ -785,18 +810,24 @@ export async function downloadAttachmentVersion(user, attachmentId, versionNo) {
   if (!att) throw new ApiError(404, 'NOT_FOUND', '附件不存在')
   const doc = await getDocById(att.doc_id)
   await assertAttachmentAccess(user, doc, false)
-  // 附件原件一律取当前版本（历史版本行仅供留痕追溯）
-  const no = att.current_version
-  void versionNo
+  // 显式指定版本号 → 取该版本行对应的不可变 key（换版不覆盖、不删除旧 key）；
+  // 未指定时才取当前版本。绝不能无视版本号一律返回最新版，否则从旧版本点进去打开的是新文件。
+  let no
+  if (versionNo !== undefined && versionNo !== null && String(versionNo).trim() !== '') {
+    no = Math.trunc(Number(versionNo))
+    if (!Number.isInteger(no) || no <= 0) throw new ApiError(400, 'BAD_REQUEST', '附件版本号必须为正整数')
+  } else {
+    no = att.current_version
+  }
   const vrows = await query('SELECT * FROM writing_attachment_versions WHERE attachment_id = ? AND version_no = ?', [attachmentId, no])
-  if (!vrows.length) throw new ApiError(404, 'NOT_FOUND', '该附件版本不存在')
+  if (!vrows.length) throw new ApiError(404, 'NOT_FOUND', `该附件第 ${no} 版不存在`)
   const v = vrows[0]
-  if (!v.size_bytes) throw new ApiError(409, 'NOT_UPLOADED', '该版本尚未上传完成（对象存储中无原件）。')
+  if (!v.size_bytes) throw new ApiError(409, 'NOT_UPLOADED', `第 ${no} 版尚未上传完成（对象存储中无原件）。`)
   let buf
   try {
     buf = await getObject(v.object_key)
   } catch {
-    throw new ApiError(404, 'OBJECT_MISSING', '对象存储中未找到该版本原件（key 不可变，不会被换版影响）。')
+    throw new ApiError(404, 'OBJECT_MISSING', `对象存储中未找到第 ${no} 版原件（key 不可变，不会被换版影响）。`)
   }
   return { filename: att.filename, version_no: v.version_no, content_type: v.content_type || 'application/octet-stream', buf }
 }

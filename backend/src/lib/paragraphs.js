@@ -102,7 +102,9 @@ function mergeParagraph(id, B, H, P) {
 /**
  * 三路合并。
  * @param {object} meta 可选 { incomingActorName, pendingActorName, sectionTitles }
- * @returns {{merged:object, conflicts:Array, autoMerged:number}}
+ * @returns {{merged:object, conflicts:Array, autoMerged:number, incorporated:Array}}
+ *   incorporated：自动并入结果的、仅由先来者（incoming/head）一方做出的段落级变化，
+ *   供保存后明示「对方这些改动已并入，未被覆盖」。逐段冲突不在其中（走取舍流程）。
  */
 export function threeWayMerge(base, incoming, pending, meta = {}) {
   const bi = indexSections(base)
@@ -110,8 +112,24 @@ export function threeWayMerge(base, incoming, pending, meta = {}) {
   const pi = indexSections(pending)
   const keys = new Set([...bi.keys(), ...hi.keys(), ...pi.keys()])
   const conflicts = []
+  const incorporated = []
   const mergedSections = []
   let autoMerged = 0
+
+  // 判断某段是否为「只有先来者动过、后来者没碰」从而被自动并入；返回并入明细或 null。
+  function incomingOnlyChange(B, H, P, id) {
+    const b = stateOf(B, id)
+    const h = stateOf(H, id)
+    const p = stateOf(P, id)
+    const same = (x, y) => x.present === y.present && (!x.present || x.text === y.text)
+    if (b.present) {
+      if (same(p, b) && h.present && !same(h, b)) return { change: 'modified', incoming_text: h.text }
+      if (same(p, b) && !h.present) return { change: 'deleted', incoming_text: '' }
+    } else if (h.present && !p.present) {
+      return { change: 'added', incoming_text: h.text }
+    }
+    return null
+  }
 
   for (const key of keys) {
     const B = bi.get(key)
@@ -126,10 +144,26 @@ export function threeWayMerge(base, incoming, pending, meta = {}) {
       const r = mergeParagraph(id, B, H, P)
       if (r.action === 'delete') {
         deleted.add(id)
+        const only = incomingOnlyChange(B, H, P, id)
+        if (only) {
+          incorporated.push({
+            section_key: key, section_title: title, paragraph_id: id,
+            change: only.change, base_text: B?.map.get(id)?.text ?? '', incoming_text: only.incoming_text,
+            incoming_actor_name: meta.incomingActorName || '',
+          })
+        }
       } else if (r.action === 'take') {
         if (!chosen.has(id) && !order.includes(id)) order.push(id)
         chosen.set(id, { text: r.text, sensitive: r.sensitive })
         if (!B?.map.has(id) || r.text !== (B.map.get(id)?.text)) autoMerged++
+        const only = incomingOnlyChange(B, H, P, id)
+        if (only) {
+          incorporated.push({
+            section_key: key, section_title: title, paragraph_id: id,
+            change: only.change, base_text: B?.map.get(id)?.text ?? '', incoming_text: only.incoming_text,
+            incoming_actor_name: meta.incomingActorName || '',
+          })
+        }
       } else {
         // 冲突段落先按先来者文本占位（取舍界面可改），并登记
         if (!order.includes(id)) order.push(id)
@@ -164,5 +198,5 @@ export function threeWayMerge(base, incoming, pending, meta = {}) {
     })
   }
 
-  return { merged: { sections: mergedSections }, conflicts, autoMerged }
+  return { merged: { sections: mergedSections }, conflicts, autoMerged, incorporated }
 }

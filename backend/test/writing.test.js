@@ -72,6 +72,34 @@ test('三路合并：双方各自新增不同段落 → 都保留；新增同文
   assert.equal(same.merged.sections[0].paragraphs.filter((p) => p.id === 'n1').length, 1)
 })
 
+test('三路合并：双方改不同段落 → 自动并入对方改动，并逐段给出 incorporated 明细', () => {
+  const B = C({ s: [['p1', '甲方原文'], ['p2', '乙方原文'], ['p3', '不动段']] })
+  const H = C({ s: [['p1', '先来者改了甲'], ['p2', '乙方原文'], ['p3', '不动段'], ['h1', '先来者新增']] })
+  const P = C({ s: [['p1', '甲方原文'], ['p2', '后来者改了乙'], ['p3', '不动段']] })
+  const r = threeWayMerge(B, H, P, { incomingActorName: '代理人' })
+  assert.equal(r.conflicts.length, 0)
+  const m = r.merged.sections[0].paragraphs
+  // 双方改动都在合并稿里：先来者的 p1 与新增 h1 不被后来者提交吞掉
+  assert.equal(m.find((p) => p.id === 'p1').text, '先来者改了甲')
+  assert.equal(m.find((p) => p.id === 'p2').text, '后来者改了乙')
+  assert.equal(m.find((p) => p.id === 'p3').text, '不动段')
+  assert.ok(m.some((p) => p.id === 'h1'))
+  // 并入明细：p1 修改 + h1 新增（后来者自己改的 p2 不在其中）
+  const byId = Object.fromEntries(r.incorporated.map((it) => [it.paragraph_id, it.change]))
+  assert.deepEqual(byId, { p1: 'modified', h1: 'added' })
+  assert.equal(r.incorporated[0].incoming_actor_name, '代理人')
+})
+
+test('三路合并：先来者删段、后来者没碰该段 → 并入明细标 deleted', () => {
+  const B = C({ s: [['p1', '留'], ['p2', '被先来者删']] })
+  const H = C({ s: [['p1', '留']] })
+  const P = C({ s: [['p1', '留'], ['p2', '被先来者删']] })
+  const r = threeWayMerge(B, H, P)
+  assert.equal(r.conflicts.length, 0)
+  assert.equal(r.merged.sections[0].paragraphs.some((p) => p.id === 'p2'), false)
+  assert.deepEqual(r.incorporated.map((it) => [it.paragraph_id, it.change]), [['p2', 'deleted']])
+})
+
 test('脱敏：参数/文献号按规则句内遮蔽；在先引用整章隐藏；sensitive 段整段隐藏', () => {
   const content = C({
     solution: [['p1', '在 85℃ 与 62% 孔隙率下焊接，参见 CN 114123456 A。'], ['p2', '普通段落不应遮蔽']],

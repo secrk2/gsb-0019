@@ -21,6 +21,23 @@
       </div>
     </div>
 
+    <!-- 自动并入提示：本次保存基于旧版本，先来者已保存的段落改动经三路合并自动并入，逐段列明 -->
+    <div v-if="mergeNotice" class="conflict-banner mt16" style="border-color: var(--purple)">
+      <div class="row spread">
+        <strong>↗️ 已自动并入 {{ mergeNotice.items.length }} 处对方改动（v{{ mergeNotice.head_version_no }}，{{ mergeNotice.head_actor_name }} 先保存）</strong>
+        <button class="btn sm" @click="mergeNotice = null">知道了</button>
+      </div>
+      <p class="small" style="margin: 6px 0 0">你保存时链头已有新版本：以下你未改动的段落已按对方版本自动并入，双方内容都在新版本里，无人被覆盖；同段双改则会逐段弹取舍。</p>
+      <ul class="small" style="margin: 6px 0 0; padding-left: 18px">
+        <li v-for="(it, i) in mergeNotice.items" :key="i">
+          <span class="chip purple">{{ mergeChangeText(it.change) }}</span>
+          <strong>{{ it.section_title }}</strong>：
+          <template v-if="it.change === 'deleted'">对方删除了该段（基线原文：{{ snippet(it.base_text) }}）</template>
+          <template v-else>{{ snippet(it.incoming_text) }}</template>
+        </li>
+      </ul>
+    </div>
+
     <!-- 待取舍冲突横幅：不锁定、可继续看全文，必须逐段取舍后才生成合并版本 -->
     <div v-if="doc.conflicts.length" class="conflict-banner mt16">
       <div class="row spread">
@@ -330,6 +347,14 @@ const choices = ref([])
 const solving = ref(false)
 const resolveError = ref('')
 
+// 自动并入明细（保存响应 merged_incoming）：明示先来者哪些段已随本次保存并入
+const mergeNotice = ref(null)
+function snippet(t, n = 60) {
+  const s = String(t || '')
+  return s.length > n ? `${s.slice(0, n)}…` : s
+}
+function mergeChangeText(c) { return ({ added: '对方新增', modified: '对方修改', deleted: '对方删除' })[c] || c }
+
 const voidOpen = ref(false)
 const voidReason = ref('')
 const voidError = ref('')
@@ -374,7 +399,9 @@ function cloneHeadForEdit() {
 
 watch(
   () => [props.doc.id, props.doc.current_version, props.doc.conflicts.length],
-  () => {
+  (cur, old) => {
+    // 并入提示只在切换文档时清；保存后 reload 会使 current_version 变化，不能顺手清掉刚弹出的提示
+    if (!old || cur?.[0] !== old[0]) mergeNotice.value = null
     conflict.value = null
     maskPreview.value = false
     maskedDoc.value = null
@@ -419,6 +446,7 @@ async function doSave(finalize) {
       summary: saveSummary.value,
     })
     store.showToast(`已保存第 ${r.data.version_no} 版`, 'success')
+    mergeNotice.value = r.data.merged_incoming || null
     draft.value = null
     saveSummary.value = ''
     branchedHint.value = r.data.branched ? docVersionNo(baseVersionId.value) : null
@@ -483,6 +511,7 @@ async function submitFinal() {
       deadline: { ...dl },
     })
     store.showToast(`已定稿（v${r.data.version_no}），定稿提交期限已生成`, 'success')
+    mergeNotice.value = r.data.merged_incoming || null
     finalizeOpen.value = false
     draft.value = null
     emit('reload')

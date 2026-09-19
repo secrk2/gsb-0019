@@ -308,9 +308,9 @@ export async function seedIfEmpty() {
       for (const v of o.versions) {
         const ts = daysAgoIso(v.ago ?? 1)
         const vid = await d.insert(
-          `INSERT INTO writing_versions (doc_id, version_no, save_type, base_version_id, parent_version_id, branch_from_version_id, branch_from_version_no, content_json, summary, mask_snapshot_json, actor_id, actor_name, actor_role, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-          [docId, v.no, v.type || '草稿', v.base ?? (v.no === 1 ? null : prevId), v.parent ?? prevId, v.branch ?? null, v.branchNo ?? null,
+          `INSERT INTO writing_versions (doc_id, version_no, save_type, base_version_id, parent_version_id, branch_from_version_id, content_json, summary, mask_snapshot_json, actor_id, actor_name, actor_role, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [docId, v.no, v.type || '草稿', v.base ?? (v.no === 1 ? null : prevId), v.parent ?? prevId, v.branch ?? null,
            wc({ kind: o.kind, map: v.map }), v.summary || '', maskSnapshot, v.actorId, v.actorName, v.actorRole, ts]
         )
         prevId = vid

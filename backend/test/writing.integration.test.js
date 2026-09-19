@@ -364,6 +364,138 @@ test('脱敏规则版本化：新发 v2 规则不改写历史版本，只对之�
   assert.doesNotMatch(s2, /HX-77A/)
 })
 
+test('协同：双方改不同段落 → 后保存不丢先来者段落，响应逐段列明并入了什么', async () => {
+  const client = await asUser('client01')
+  const agent = await asUser('agent01')
+  // 案件 2（华芯，无效状态）原有无撰稿链
+  const created = await client('POST', '/cases/2/writing/disclosure', { title: '协同不丢段测试' })
+  assert.equal(created.status, 201, JSON.stringify(created.body))
+  const docId = created.body.data.id
+
+  const v1 = await client('POST', '/cases/2/writing/disclosure/save', {
+    content: content({
+      solution: [['a1', '客户写的技术方案甲段'], ['a2', '客户写的技术方案乙段']],
+      effect: [['e1', '有益效果原文']],
+    }),
+    summary: '客户 v1',
+  })
+  assert.equal(v1.status, 201)
+
+  // 代理人基于 v1：改 a1、新增 a3，没碰 a2/e1
+  const v2 = await agent('POST', '/cases/2/writing/disclosure/save', {
+    base_version_id: v1.body.data.version_id,
+    content: content({
+      solution: [['a1', '代理人补充后的甲段'], ['a2', '客户写的技术方案乙段'], ['a3', '代理人新增的实施细节段']],
+      effect: [['e1', '有益效果原文']],
+    }),
+    summary: '代理人 v2',
+  })
+  assert.equal(v2.status, 201)
+
+  // 客户仍基于 v1：只改 a2。修复前保存结果=客户整份提交，代理人的 a1/a3 被丢；
+  // 修复后应自动并入代理人改动。
+  const v3 = await client('POST', '/cases/2/writing/disclosure/save', {
+    base_version_id: v1.body.data.version_id,
+    content: content({
+      solution: [['a1', '客户写的技术方案甲段'], ['a2', '客户更新的乙段']],
+      effect: [['e1', '有益效果原文']],
+    }),
+    summary: '客户 v3',
+  })
+  assert.equal(v3.status, 201, JSON.stringify(v3.body))
+  const paras = Object.fromEntries(
+    (await client('GET', `/writing/docs/${docId}`)).body.data.head.content.sections
+      .find((s) => s.key === 'solution').paragraphs.map((p) => [p.id, p.text])
+  )
+  assert.equal(paras.a1, '代理人补充后的甲段', '先来者改过、后来者没碰的段必须并入，不能丢')
+  assert.equal(paras.a2, '客户更新的乙段')
+  assert.equal(paras.a3, '代理人新增的实施细节段', '先来者新增段必须并入')
+  assert.equal(
+    (await agent('GET', `/writing/docs/${docId}`)).body.data.head.content.sections
+      .find((s) => s.key === 'effect').paragraphs[0].text,
+    '有益效果原文'
+  )
+
+  // 响应逐段明示并入内容：a1 修改 + a3 新增；客户侧文本脱敏后仍可见明文（无敏感词）
+  const mi = v3.body.data.merged_incoming
+  assert.ok(mi, '自动并入明细必须回传')
+  assert.equal(mi.head_version_no, 2)
+  assert.equal(mi.head_actor_name, '李慕华')
+  const changes = Object.fromEntries(mi.items.map((it) => [it.paragraph_id, it.change]))
+  assert.deepEqual(changes, { a1: 'modified', a3: 'added' })
+  assert.match(mi.items.find((it) => it.paragraph_id === 'a1').incoming_text, /代理人补充后的甲段/)
+})
+
+test('协同：同一人多端基于同一旧版本改同一段 → 也登记冲突，不静默覆盖自己另一端的改动', async () => {
+  const client = await asUser('client01')
+  const created = await client('POST', '/cases/4/writing/disclosure', { title: '同人多端冲突测试' })
+  const docId = created.body.data.id
+  const v1 = await client('POST', '/cases/4/writing/disclosure/save', { content: content({ solution: [['k1', '原稿']] }) })
+  const v2 = await client('POST', '/cases/4/writing/disclosure/save', {
+    base_version_id: v1.body.data.version_id,
+    content: content({ solution: [['k1', 'A 端已保存的改写']] }),
+  })
+  assert.equal(v2.status, 201)
+  // B 端仍拿着 v1 改同一段：修复前因 head.actor_id === user.id 被静默覆盖
+  const v3 = await client('POST', '/cases/4/writing/disclosure/save', {
+    base_version_id: v1.body.data.version_id,
+    content: content({ solution: [['k1', 'B 端基于旧稿的改写']] }),
+  })
+  assert.equal(v3.status, 409)
+  assert.equal(v3.body.error.code, 'PARAGRAPH_CONFLICT')
+  assert.equal((await client('GET', `/writing/docs/${docId}`)).body.data.head.content.sections
+    .find((s) => s.key === 'solution').paragraphs[0].text, 'A 端已保存的改写')
+})
+
+test('历史版本不可变：规则再发新版后，已保存版本始终按各自快照渲染（同一份草稿两次打开一致）', async () => {
+  const admin = await asUser('admin')
+  const agent = await asUser('agent01')
+  const client = await asUser('client03')
+  // 此刻生效规则已是前面用例发布的 v2；案件 9（星野）无撰稿链
+  const created = await agent('POST', '/cases/9/writing/disclosure', { title: '快照不变性测试' })
+  const docId = created.body.data.id
+  const v1 = await agent('POST', '/cases/9/writing/disclosure/save', {
+    content: content({ solution: [['z1', '工况 85℃ 产线编号 XYZ-9（旧规则不遮蔽该编号）']] }),
+  })
+  assert.equal(v1.status, 201)
+  const clientV1Before = (await client('GET', `/writing/versions/${v1.body.data.version_id}`)).body.data.version
+  assert.equal(clientV1Before.mask_rule_version, 2)
+  const textBefore = clientV1Before.content.sections.find((s) => s.key === 'solution').paragraphs[0].text
+  assert.match(textBefore, /【温度参数】/)
+  assert.match(textBefore, /XYZ-9/)
+
+  // 发布 v3：新增 XYZ 编号遮蔽
+  const rules = (await admin('GET', '/writing/mask-rules')).body.data
+  const published = await admin('POST', '/writing/mask-rules', {
+    note: '新增 XYZ 产线编号遮蔽（测试 v3）',
+    rules: {
+      hideSections: rules.rules.hideSections,
+      hideSensitiveParagraphs: true,
+      patterns: [
+        ...rules.rules.patterns,
+        { id: 'xyz_line', name: '产线编号', regex: 'XYZ-\\d+', replacement: '【产线编号】', flags: 'g' },
+      ],
+    },
+  })
+  assert.equal(published.body.data.version, 3)
+
+  // 再次打开同一历史版本：内容必须与规则发布前完全一致
+  const clientV1After = (await client('GET', `/writing/versions/${v1.body.data.version_id}`)).body.data.version
+  assert.equal(clientV1After.mask_rule_version, 2)
+  assert.equal(clientV1After.content.sections.find((s) => s.key === 'solution').paragraphs[0].text, textBefore)
+  assert.doesNotMatch(clientV1After.content.sections.find((s) => s.key === 'solution').paragraphs[0].text, /【产线编号】/)
+
+  // 新保存的版本才按 v3 快照脱敏
+  const v2 = await agent('POST', '/cases/9/writing/disclosure/save', {
+    base_version_id: v1.body.data.version_id,
+    content: content({ solution: [['z1', '工况 85℃ 产线编号 XYZ-9（新版补充：窗口扩大）']] }),
+  })
+  assert.equal(v2.status, 201)
+  const headView = (await client('GET', `/writing/docs/${docId}`)).body.data.head
+  assert.equal(headView.mask_rule_version, 3)
+  assert.match(headView.content.sections.find((s) => s.key === 'solution').paragraphs[0].text, /【产线编号】/)
+})
+
 test('种子：说明书定稿联动期限与附件解析中状态齐备', async () => {
   const agent = await asUser('agent01')
   const c1 = (await agent('GET', '/cases/1')).body.data
